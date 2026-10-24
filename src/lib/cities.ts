@@ -46,3 +46,15 @@ export function findCity(slug?: string | null) {
   if (!slug) return undefined
   return TUNISIAN_CITIES.find((city) => city.slug === slug)
 }
+
+export function findCityByName(value?: string | null) {
+  if (!value) return undefined
+  const normalized = value.trim().toLocaleLowerCase("fr")
+  return TUNISIAN_CITIES.find(
+    (city) =>
+      city.slug === normalized ||
+      city.name.toLocaleLowerCase("fr") === normalized ||
+      city.name.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "") ===
+        normalized.normalize("NFD").replace(/[\u0300-\u036f]/g, ""),
+  )
+}

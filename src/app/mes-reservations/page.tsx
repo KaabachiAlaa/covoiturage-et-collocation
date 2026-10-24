@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { ArrowLeft, CalendarClock, LockKeyhole } from "lucide-react"
+import { ArrowLeft, LockKeyhole } from "lucide-react"
 import { SiteHeader } from "@/components/layout/site-header"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
