@@ -1,0 +1,200 @@
+﻿using Ftareqi.Application.Common;
+using Ftareqi.Application.Common.Helpers;
+using Ftareqi.Application.Common.Results;
+using Ftareqi.Application.DTOs;
+using Ftareqi.Application.DTOs.Paymob;
+using Ftareqi.Application.DTOs.Paymob.Ftareqi.Application.DTOs.Paymob;
+using Ftareqi.Application.Interfaces.Orchestrators;
+using Ftareqi.Application.Interfaces.Services;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
+using System.ComponentModel.DataAnnotations;
+using System.Text;
+
+namespace Ftareqi.API.Controllers
+{
+	[Route("api/[controller]")]
+	[ApiController]
+	public class WalletController : ControllerBase
+	{
+		private readonly ILogger<WalletController> _logger; 
+		
+		private readonly IWalletService _walletService;
+		private readonly IWalletOrchestrator _walletOrchestrator;
+
+		public WalletController(
+			ILogger<WalletController> logger,
+			IWalletService walletService,
+			IWalletOrchestrator walletOrchestrator)
+		{
+			_walletService = walletService;
+			_walletOrchestrator = walletOrchestrator;
+			_logger = logger;
+		}
+		[HttpGet()]
+		[Authorize]
+		public async Task<ActionResult<ApiResponse<WalletResDto>>> GetWallet()
+		{
+			var userId = User.GetUserId();
+			var wallet = await _walletService.GetWallet(userId);
+			if (wallet.IsSuccess)
+			{
+				return Ok(new ApiResponse<WalletResDto>
+				{
+					Errors = wallet.Errors,
+					Message = wallet.Message,
+					Success = wallet.IsSuccess,
+					Data = wallet.Data
+
+				});
+			}
+			return BadRequest(new ApiResponse
+			{
+				Errors = wallet.Errors,
+				Message = wallet.Message,
+				Success = wallet.IsSuccess,
+			});
+		}
+
+		[HttpGet("transactions")]
+		[Authorize]
+		public async Task<ActionResult<ApiResponse<PaginatedResponse<TransactionDto>>>> WalletTransactions([FromQuery] GenericQueryReq queryReq)
+		{
+			var userId = User.GetUserId();
+			var transactions = await _walletService.GetWalletTransactionsPaginated(userId, queryReq);
+			if (transactions.IsSuccess) {
+				return Ok(new ApiResponse<PaginatedResponse<TransactionDto>>
+				{
+					Errors = transactions.Errors,
+					Message = transactions.Message,
+					Success = transactions.IsSuccess,
+					Data = transactions.Data
+				});
+			}
+			return BadRequest(new ApiResponse
+			{
+				Errors = transactions.Errors,
+				Message = transactions.Message,
+				Success = transactions.IsSuccess,
+			});
+		}
+
+		[HttpGet("transactions/export")]
+		[Authorize]
+		public async Task<ActionResult> ExportWalletTransactions()
+		{
+			var userId = User.GetUserId();
+			var exportResult = await _walletOrchestrator.ExportWalletTransactionsCsvAsync(userId);
+			if (exportResult.IsFailure || exportResult.Data == null)
+			{
+				return BadRequest(new ApiResponse
+				{
+					Errors = exportResult.Errors,
+					Message = exportResult.Message,
+					Success = exportResult.IsSuccess,
+				});
+			}
+
+			return File(exportResult.Data.Content, exportResult.Data.ContentType, exportResult.Data.FileName);
+		}
+		[Authorize]
+		[HttpPost("top-up/mobile-wallet")]
+		public async Task<ActionResult<ApiResponse<PaymentResponseDto>>> TopUpWithWallet(TopUpWithWalletReqDto model)
+		{
+			var userId = User.GetUserId();
+			if (!ModelState.IsValid || userId==null)
+			{
+				return BadRequest(new ApiResponse
+				{
+					Errors = ["Validation errors"],
+					Message = "Validation errors",
+					Success = false,
+				});
+			}
+			
+			var result = await _walletOrchestrator.TopUpWithWalletAsync(userId, model);
+			if (!result.IsSuccess){
+				return BadRequest(new ApiResponse
+				{
+					Errors = result.Errors,
+					Message = result.Message,
+					Success = result.IsSuccess,
+				});
+			}
+			return Ok(new ApiResponse<PaymentResponseDto>
+			{
+				Errors = result.Errors,
+				Message = result.Message,
+				Data = result.Data,
+				Success = result.IsSuccess,
+
+			});
+		}
+
+		[Authorize]
+		[HttpPost("top-up/card")]
+		public async Task<ActionResult<ApiResponse<PaymentResponseDto>>> TopUpWithCard(TopUpWithCardReqDto model)
+		{
+			var userId = User.GetUserId();
+			if (!ModelState.IsValid || userId == null)
+			{
+				return BadRequest(new ApiResponse
+				{
+					Errors = ["Validation errors"],
+					Message = "Validation errors",
+					Success = false,
+				});
+			}
+			var result = await _walletOrchestrator.TopUpWithCardAsync(userId, model);
+			if (!result.IsSuccess)
+			{
+				return BadRequest(new ApiResponse
+				{
+					Errors = result.Errors,
+					Message = result.Message,
+					Success = result.IsSuccess,
+				});
+			}
+			return Ok(new ApiResponse<PaymentResponseDto>
+			{
+				Errors = result.Errors,
+				Message = result.Message,
+				Data = result.Data,
+				Success = result.IsSuccess,
+			});
+		}
+
+		[HttpPost("callback")]
+		public async Task<IActionResult> Callback([FromQuery] string hmac)
+		{
+			string rawBody;
+			using (var reader = new StreamReader(Request.Body, Encoding.UTF8))
+				rawBody = await reader.ReadToEndAsync();
+
+			_logger.LogInformation("Raw callback body: {Body}", rawBody);
+
+			PaymobCallbackDto? callback;
+			try
+			{
+				callback = JsonConvert.DeserializeObject<PaymobCallbackDto>(rawBody);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Failed to deserialize callback body");
+				return Ok();
+			}
+
+			if (callback == null)
+			{
+				_logger.LogError("Callback deserialized to null. Raw body was: {Body}", rawBody);
+				return Ok();
+			}
+
+			await _walletOrchestrator.HandleCallbackAsync(hmac, callback);
+			return Ok();
+		}
+
+	}
+}
