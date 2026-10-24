@@ -12,6 +12,7 @@ const links = [
   { href: "/", label: "Accueil" },
   { href: "/covoiturage", label: "Covoiturage" },
   { href: "/colocation", label: "Colocation" },
+  { href: "/mes-reservations", label: "Mes réservations" },
 ]
 
 export function SiteHeader() {
@@ -61,7 +62,7 @@ export function SiteHeader() {
             <nav className="flex flex-col gap-2" aria-label="Navigation mobile">
               {links.map((link) => <Link onClick={() => setOpen(false)} key={link.href} href={link.href} className="rounded-lg px-3 py-3 text-sm font-medium hover:bg-muted">{link.label}</Link>)}
               <Link onClick={() => setOpen(false)} href="/covoiturage/publier" className="mt-2 rounded-lg bg-primary px-3 py-3 text-center text-sm font-semibold text-primary-foreground">Publier un trajet</Link>
-              <Link onClick={() => setOpen(false)} href="/connexion" className="rounded-lg px-3 py-3 text-sm font-medium hover:bg-muted">Connexion</Link>
+              <Link onClick={() => setOpen(false)} href="/mes-reservations" className="rounded-lg px-3 py-3 text-sm font-medium hover:bg-muted">Mes réservations</Link><Link onClick={() => setOpen(false)} href="/connexion" className="rounded-lg px-3 py-3 text-sm font-medium hover:bg-muted">Connexion</Link>
             </nav>
           </SheetContent>
         </Sheet>

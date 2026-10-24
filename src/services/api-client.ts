@@ -122,7 +122,7 @@ async function parseError(response: Response): Promise<ApiError> {
     }
     serverMessage = json.message ?? json.title ?? undefined
     if (Array.isArray(json.errors)) details = json.errors
-    else if (json.errors && typeof json.errors === "object") details = Object.values(json.errors).flat()
+    else if (json.errors && typeof json.errors === "object") details = Object.values(json.errors).flat() as string[]
   } catch {
     // body is not JSON
   }
