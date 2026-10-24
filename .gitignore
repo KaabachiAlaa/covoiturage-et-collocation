@@ -383,3 +383,9 @@ appsettings.Development.json
 .DS_Store
 Thumbs.db
 .env
+
+# Next.js frontend
+.next/
+next-env.d.ts
+*.tsbuildinfo
+.env*.local
