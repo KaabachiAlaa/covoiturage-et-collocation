@@ -1,0 +1,186 @@
+using Ftareqi.Domain.Models;
+using Ftareqi.Domain.ValueObjects;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Reflection.Emit;
+
+namespace Ftareqi.Persistence
+{
+	public class ApplicationDbContext : IdentityDbContext<User>
+	{
+		public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+			: base(options)
+		{
+		}
+		public DbSet<RefreshToken> RefreshTokens { get; set; }
+		public DbSet<OTP> OTPs { get; set; }
+		public DbSet<WalletTransaction> WalletTransactions { get; set; }
+		public DbSet<PaymentTransaction> PaymentTransactions { get; set; }
+		public DbSet<Notification> Notifications { get; set; }
+		public DbSet<Ride> Rides { get; set; }
+		public DbSet<RideBooking> RideBookings { get; set; }
+		public DbSet<RidePreferences> RidePreferences { get; set; }
+		public DbSet<Review> Reviews { get; set; }
+		public DbSet<Report> Reports { get; set; }
+		public DbSet<Ban> Bans { get; set; }
+
+		protected override void OnModelCreating(ModelBuilder builder)
+		{
+			base.OnModelCreating(builder);
+
+			builder.Entity<IdentityRole>().HasData(
+				new IdentityRole
+				{
+					Id = "role-admin",
+					Name = "Admin",
+					NormalizedName = "ADMIN",
+					ConcurrencyStamp = "11111111-aaaa-bbbb-cccc-111111111111"
+				},
+				new IdentityRole
+				{
+					Id = "role-user",
+					Name = "User",
+					NormalizedName = "USER",
+					ConcurrencyStamp = "22222222-aaaa-bbbb-cccc-222222222222"
+				},
+				new IdentityRole
+				{
+					Id = "role-moderator",
+					Name = "Moderator",
+					NormalizedName = "MODERATOR",
+					ConcurrencyStamp = "33333333-aaaa-bbbb-cccc-333333333333"
+				}
+			);
+
+			//password is Admin@123
+			builder.Entity<User>().HasData(
+				new User
+				{
+					Id = "admin1",
+					UserName = "admin@ftareqi.com",
+					NormalizedUserName = "ADMIN@FTAREQI.COM",
+					Email = "admin@ftareqi.com",
+					NormalizedEmail = "ADMIN@FTAREQI.COM",
+					EmailConfirmed = true,
+					SecurityStamp = "44444444-aaaa-bbbb-cccc-444444444444",
+					FullName = "Ziad Rawash",
+					Gender = Ftareqi.Domain.Enums.Gender.Male,
+					DateOfBirth = new DateTime(2004, 8, 11),
+					CreatedAt = new DateTime(2025, 12, 1, 0, 0, 0, DateTimeKind.Utc),
+					PenaltyCount = 0,
+					IsDeleted = false,
+					PhoneNumber = "+200000000000",
+					PhoneNumberConfirmed = true,
+					TwoFactorEnabled = false,
+					PasswordHash = "AQAAAAIAAYagAAAAELdvbbsNSTpjlcUQ5MZpRUQ5N2Bg93tunei18Crmhcqe3/dZJz5UIr9TK/4BXLuyUg==",
+					ConcurrencyStamp = "55555555-aaaa-bbbb-cccc-555555555555"
+				}
+			);
+
+			builder.Entity<UserWallet>()
+				.Property(x => x.Balance)
+				.HasPrecision(18, 2);
+
+			builder.Entity<WalletTransaction>()
+				.Property(x => x.BalanceAfter)
+				.HasPrecision(18, 2);
+
+			builder.Entity<WalletTransaction>()
+				.Property(x => x.BalanceBefore)
+				.HasPrecision(18, 2);
+			builder.Entity<WalletTransaction>()
+				.HasOne(x => x.RideBooking)
+				.WithMany()
+				.HasForeignKey(x => x.RideBookingId)
+				.OnDelete(DeleteBehavior.SetNull);
+			builder.Entity<WalletTransaction>()
+				.Property(x => x.Amount)
+				.HasPrecision(18, 2);
+
+			builder.Entity<UserWallet>()
+				.Property(x => x.LockedBalance)
+				.HasPrecision(18, 2);
+
+			builder.Entity<PaymentTransaction>()
+				.Property(x => x.Amount)
+				.HasPrecision(18, 2);
+			builder.Entity<Ride>().
+				Property(x => x.StartLocation)
+				.HasColumnType("geography");
+			builder.Entity<Ride>()
+				.Property(x => x.StartAddress)
+				.HasMaxLength(300)
+				.IsRequired();
+			builder.Entity<Ride>().
+				Property(x => x.EndLocation)
+				.HasColumnType("geography");
+			builder.Entity<Ride>()
+				.Property(x => x.EndAddress)
+				.HasMaxLength(300)
+				.IsRequired();
+
+			builder.Entity<Ride>()
+				.Property(x => x.PricePerSeat)
+				.HasPrecision(18, 2);
+
+			builder.Entity<Ride>()
+				.HasOne(x => x.RidePreferences)
+				.WithOne(x => x.Ride)
+				.HasForeignKey<RidePreferences>(x => x.RideId)
+				.OnDelete(DeleteBehavior.Cascade);
+
+			builder.Entity<RideBooking>()
+				.HasOne(x => x.User)
+				.WithMany(x => x.RideBookings)
+				.HasForeignKey(x => x.UserId)
+				.OnDelete(DeleteBehavior.NoAction);
+
+			builder.Entity<RideBooking>()
+				.HasOne(x => x.Ride)
+				.WithMany(x => x.RideBookings)
+				.HasForeignKey(x => x.RideId)
+				.OnDelete(DeleteBehavior.NoAction);
+
+			builder.Entity<Report>()
+				.HasOne(r => r.ReporterUser)
+				.WithMany(u => u.ReportsMade)
+				.HasForeignKey(r => r.ReporterUserId)
+				.OnDelete(DeleteBehavior.Restrict);
+
+			builder.Entity<Report>()
+				.HasOne(r => r.ReportedUser)
+				.WithMany(u => u.ReportsReceived)
+				.HasForeignKey(r => r.ReportedUserId)
+				.OnDelete(DeleteBehavior.Restrict);
+
+				builder.Entity<Ban>()
+					.HasOne(b => b.DriverProfile)
+					.WithMany(d => d.Bans)
+					.HasForeignKey(b => b.DriverProfileId)
+					.OnDelete(DeleteBehavior.Restrict);
+
+				builder.Entity<Ban>()
+					.HasOne(b => b.BannedByUser)
+					.WithMany(u => u.BansIssued)
+					.HasForeignKey(b => b.BannedByUserId)
+					.OnDelete(DeleteBehavior.Restrict);
+				
+			builder.Entity<IdentityUserRole<string>>().HasData(
+				new IdentityUserRole<string>
+				{
+					UserId = "admin1",
+					RoleId = "role-admin"
+				}
+
+			);
+
+			//  Data is just a normal string column - no converter needed
+			builder.Entity<Notification>()
+				.Property(e => e.Data)
+				.HasColumnType("nvarchar(max)")
+				.IsRequired();
+		}
+	}
+}

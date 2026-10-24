@@ -1,0 +1,809 @@
+﻿using Ftareqi.Application.Common.Helpers;
+using Ftareqi.Application.Common.Results;
+using Ftareqi.Application.DTOs.Bookings;
+using Ftareqi.Application.DTOs.Notification;
+using Ftareqi.Application.DTOs.Rides;
+using Ftareqi.Application.Interfaces.BackgroundJobs;
+using Ftareqi.Application.Interfaces.Orchestrators;
+using Ftareqi.Application.Interfaces.Repositories;
+using Ftareqi.Application.Interfaces.Services;
+using Ftareqi.Domain.Constants;
+using Ftareqi.Domain.Enums;
+using Ftareqi.Domain.Models;
+using Ftareqi.Domain.ValueObjects;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Ftareqi.Application.Orchestrators
+{
+	public class RideOrchestrator : IRideOrchestrator
+	{
+		private readonly ILogger<RideOrchestrator> _logger;
+		private readonly IUnitOfWork _unitOfWork;
+		private readonly IRideService _rideService;
+		private readonly IWalletService _walletService;
+		private readonly IBookingService _bookingService;
+		private readonly IBackgroundJobService _backgroundJobService;
+		private readonly INotificationOrchestrator _notificationOrchestrator;
+		public RideOrchestrator(ILogger<RideOrchestrator> logger, IUnitOfWork unitOfWork,
+			IRideService rideService, IWalletService walletService,
+			 IBookingService bookingService,
+			 IBackgroundJobService backgroundJobService,
+			 INotificationOrchestrator notificationOrchestrator
+			 )
+		{
+
+			_logger = logger;
+			_unitOfWork = unitOfWork;
+			_rideService = rideService;
+			_walletService = walletService;
+			_bookingService = bookingService;
+			_backgroundJobService = backgroundJobService;
+			_notificationOrchestrator = notificationOrchestrator;
+
+		}
+		public async Task<Result> CreateRideBookingRequest(CreateBookingRequestDto model, string userId)
+		{
+			var userFound = await _unitOfWork.Users.GetByIdAsync(userId);
+			if (userFound == null)
+			{
+				_logger.LogError("user with {id} not found", userId);
+				return Result.Failure("User not found");
+			}
+			var rideFound = await _unitOfWork.Rides.FirstOrDefaultAsNoTrackingAsync(x => x.Id == model.RideId);
+			if (rideFound == null)
+			{
+				_logger.LogError("no such ride with id :{id}", model.RideId);
+				return Result.Failure("ride not found");
+			}
+			var driverProfile = await _unitOfWork.DriverProfiles.FirstOrDefaultAsNoTrackingAsync(x => x.Id == rideFound.DriverProfileId);
+			if (driverProfile == null)
+			{
+				_logger.LogError("no driver profile found for ride id :{id}", model.RideId);
+				return Result.Failure("driver not found");
+			}
+			var totalMoney = rideFound.PricePerSeat * model.NumberOfSeats;
+
+			await using var tx = await _unitOfWork.BeginTransactionAsync();
+			try
+			{
+				var moneyLocked = await _walletService.LockAmountAsync(userId, totalMoney);
+				if (moneyLocked.IsFailure || moneyLocked.Data == null)
+				{
+					await tx.RollbackAsync();
+					return Result.Failure(moneyLocked.Message);
+				}
+
+				var reservedBooking = await _bookingService.CreateBooking(model, userId);
+				if (reservedBooking.IsFailure || reservedBooking.Data == null)
+				{
+					await tx.RollbackAsync();
+					return Result.Failure(reservedBooking.Message);
+				}
+
+				moneyLocked.Data.RideBooking = reservedBooking.Data;
+				moneyLocked.Data.UpdatedAt = DateTime.UtcNow;
+
+				await _unitOfWork.SaveChangesAsync();
+				await tx.CommitAsync();
+
+				var delay = reservedBooking.Data.ExpiresAt - DateTime.UtcNow;
+				if (delay < TimeSpan.Zero)
+				{
+					delay = TimeSpan.Zero;
+				}
+
+				var jobId = await _backgroundJobService.ScheduleAsync<IBookingJobs>(
+					job => job.ExpireBookingAsync(reservedBooking.Data.Id),
+					delay);
+
+				await SendWalletAmountReservedNotification(userId, moneyLocked.Data.UserWalletId, totalMoney);
+				await SendRequestNotification(driverProfile.UserId, reservedBooking.Data.Id);
+				_logger.LogInformation("Booking {BookingId} created for user {UserId}. Expiration job {JobId} scheduled to run at {ExpiresAt}", reservedBooking.Data.Id, userId, jobId, reservedBooking.Data.ExpiresAt);
+
+				return Result.Success("Booking Created successfully");
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "CreateRideBookingRequest failed for user {UserId}", userId);
+				await tx.RollbackAsync();
+				return Result.Failure("Unexpected error happened while creating booking request");
+			}
+		}
+		public async Task<Result> AcceptRideBookingRequest(int bookingId, string driverId)
+		{
+			var booking = await _unitOfWork.RideBookings.FirstOrDefaultAsync(
+				x => x.Id == bookingId && !x.IsDeleted,
+				x => x.Ride,
+				x => x.Ride!.DriverProfile);
+			if (booking == null)
+			{
+				return Result.Failure("Booking not found");
+			}
+			var rideAccepted= await _bookingService.AcceptBooking(bookingId, driverId);
+			if (rideAccepted.IsFailure)
+			{
+				_logger.LogError("Error Happened :{error}", rideAccepted.Message);
+				return Result.Failure(rideAccepted.Message);
+			}
+			await SendAcceptNotification(booking!.UserId, bookingId);
+			return Result.Success("Booking Accepted successfully");
+		}
+		public async Task<Result> DeclineRideBookingRequest(int bookingId, string driverId)
+		{
+			if (string.IsNullOrWhiteSpace(driverId))
+			{
+				return Result.Failure("Driver user id is required");
+			}
+
+			var booking = await _unitOfWork.RideBookings.FirstOrDefaultAsync(
+				x => x.Id == bookingId && !x.IsDeleted,
+				x => x.Ride,
+				x => x.Ride!.DriverProfile);
+
+			if (booking == null)
+			{
+				return Result.Failure("Booking not found");
+			}
+
+			if (booking.Ride == null || booking.Ride.DriverProfile == null)
+			{
+				return Result.Failure("Ride not found for this booking");
+			}
+
+			if (booking.Ride.DriverProfile.UserId != driverId)
+			{
+				return Result.Failure("You are not authorized to decline this booking");
+			}
+
+			if (booking.Status != BookingStatus.Pending)
+			{
+				return Result.Failure("Only pending bookings can be declined");
+			}
+
+			await using var tx = await _unitOfWork.BeginTransactionAsync();
+			try
+			{
+				var cancelResult = await _bookingService.CancelBooking(bookingId, BookingCancellationType.Driver);
+				if (cancelResult.IsFailure)
+				{
+					await tx.RollbackAsync();
+					return Result.Failure(cancelResult.Message);
+				}
+
+				var releaseResult = await ReleaseLockedAmountForBooking(bookingId, booking.UserId);
+				if (releaseResult.IsFailure)
+				{
+					_logger.LogError("DeclineRideBookingRequest: booking {BookingId} declined but failed to release locked amount for user {UserId}. Error: {Error}", bookingId, booking.UserId, releaseResult.Message);
+					await tx.RollbackAsync();
+					return Result.Failure($"Booking declined but failed to release locked amount. {releaseResult.Message}");
+				}
+
+				await _unitOfWork.SaveChangesAsync();
+				await tx.CommitAsync();
+
+				if (releaseResult.Data > 0)
+				{
+					var bookingWallet = await _unitOfWork.UserWallets.FirstOrDefaultAsNoTrackingAsync(x => x.UserId == booking.UserId);
+					if (bookingWallet != null)
+					{
+						await SendWalletAmountReleasedNotification(booking.UserId, bookingWallet.Id, releaseResult.Data);
+					}
+				}
+
+				await SendDeclineNotification(booking.UserId, bookingId);
+				return Result.Success("Booking declined successfully");
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "DeclineRideBookingRequest failed for booking {BookingId}", bookingId);
+				await tx.RollbackAsync();
+				return Result.Failure("Unexpected error happened while declining booking");
+			}
+		}
+		public async Task<Result> CancelRideBookingByRider(int bookingId, string riderId)
+		{
+			if (string.IsNullOrWhiteSpace(riderId))
+			{
+				return Result.Failure("Rider user id is required");
+			}
+
+			var booking = await _unitOfWork.RideBookings.FirstOrDefaultAsync(
+				x => x.Id == bookingId && !x.IsDeleted,
+				x => x.Ride,
+				x => x.Ride!.DriverProfile);
+
+			if (booking == null)
+			{
+				return Result.Failure("Booking not found");
+			}
+
+			if (!string.Equals(booking.UserId, riderId, StringComparison.Ordinal))
+			{
+				return Result.Failure("You are not authorized to cancel this booking");
+			}
+
+			if (booking.Status != BookingStatus.Pending && booking.Status != BookingStatus.Accepted)
+			{
+				return Result.Failure("Only pending or accepted bookings can be cancelled by rider");
+			}
+
+			await using var tx = await _unitOfWork.BeginTransactionAsync();
+			try
+			{
+				var cancelResult = await _bookingService.CancelBooking(bookingId, BookingCancellationType.Rider);
+				if (cancelResult.IsFailure)
+				{
+					await tx.RollbackAsync();
+					return Result.Failure(cancelResult.Message);
+				}
+
+				var releaseResult = await ReleaseLockedAmountForBooking(bookingId, riderId);
+				if (releaseResult.IsFailure)
+				{
+					_logger.LogError("CancelRideBookingByRider: booking {BookingId} cancelled by rider but failed to release locked amount for user {UserId}. Error: {Error}", bookingId, riderId, releaseResult.Message);
+					await tx.RollbackAsync();
+					return Result.Failure($"Booking cancelled but failed to release locked amount. {releaseResult.Message}");
+				}
+
+				await _unitOfWork.SaveChangesAsync();
+				await tx.CommitAsync();
+
+				if (releaseResult.Data > 0)
+				{
+					var riderWallet = await _unitOfWork.UserWallets.FirstOrDefaultAsNoTrackingAsync(x => x.UserId == riderId);
+					if (riderWallet != null)
+					{
+						await SendWalletAmountReleasedNotification(riderId, riderWallet.Id, releaseResult.Data);
+					}
+				}
+
+				return Result.Success("Booking cancelled successfully");
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "CancelRideBookingByRider failed for booking {BookingId}", bookingId);
+				await tx.RollbackAsync();
+				return Result.Failure("Unexpected error happened while cancelling booking");
+			}
+		}
+		public async Task<Result> CancelRide(int rideId, string driverId)
+		{
+			if (rideId <= 0)
+			{
+				return Result.Failure("Valid ride id is required");
+			}
+
+			if (string.IsNullOrWhiteSpace(driverId))
+			{
+				return Result.Failure("Driver user id is required");
+			}
+
+			var rideFound = await _unitOfWork.Rides.FirstOrDefaultAsync(
+				x => x.Id == rideId,
+				x => x.DriverProfile,
+				x => x.RideBookings);
+
+			if (rideFound == null)
+			{
+				return Result.Failure("Ride not found");
+			}
+
+			if (rideFound.DriverProfile == null)
+			{
+				return Result.Failure("Driver profile not found for this ride");
+			}
+
+			if (!string.Equals(rideFound.DriverProfile.UserId, driverId, StringComparison.Ordinal))
+			{
+				return Result.Failure("You are not authorized to cancel this ride");
+			}
+
+			if (rideFound.Status != RideStatus.Scheduled)
+			{
+				return Result.Failure("Only scheduled rides can be cancelled");
+			}
+
+			var cancellableBookings = rideFound.RideBookings
+				.Where(booking =>
+					!booking.IsDeleted &&
+					booking.Status != BookingStatus.CancelledByRider &&
+					booking.Status != BookingStatus.CancelledByDriver &&
+					booking.Status != BookingStatus.Expired)
+				.ToList();
+
+			var cancellationsToNotify = new List<(string UserId, int BookingId)>();
+			var walletReleasesToNotify = new List<(string UserId, int WalletId, decimal Amount)>();
+			await using var tx = await _unitOfWork.BeginTransactionAsync();
+			try
+			{
+				foreach (var booking in cancellableBookings)
+				{
+					var cancelResult = await _bookingService.CancelBooking(booking.Id, BookingCancellationType.Driver);
+					if (cancelResult.IsFailure)
+					{
+						await tx.RollbackAsync();
+						return Result.Failure(cancelResult.Message);
+					}
+
+					var releaseResult = await ReleaseLockedAmountForBooking(booking.Id, booking.UserId);
+					if (releaseResult.IsFailure)
+					{
+						_logger.LogError("CancelRide: booking {BookingId} failed to release amount for user {UserId}. Error: {Error}", booking.Id, booking.UserId, releaseResult.Message);
+						await tx.RollbackAsync();
+						return Result.Failure($"Booking cancelled but failed to release locked amount. {releaseResult.Message}");
+					}
+
+					cancellationsToNotify.Add((booking.UserId, booking.Id));
+
+					if (releaseResult.Data > 0)
+					{
+						var riderWallet = await _unitOfWork.UserWallets.FirstOrDefaultAsNoTrackingAsync(x => x.UserId == booking.UserId);
+						if (riderWallet != null)
+						{
+							walletReleasesToNotify.Add((booking.UserId, riderWallet.Id, releaseResult.Data));
+						}
+					}
+				}
+
+				rideFound.Status = RideStatus.Cancelled;
+				rideFound.CancelledAt = DateTime.UtcNow;
+				rideFound.UpdatedAt = DateTime.UtcNow;
+				_unitOfWork.Rides.Update(rideFound);
+
+				await _unitOfWork.SaveChangesAsync();
+				await tx.CommitAsync();
+
+				foreach (var (userId, walletId, amount) in walletReleasesToNotify)
+				{
+					await SendWalletAmountReleasedNotification(userId, walletId, amount);
+				}
+
+				if (cancellationsToNotify.Any())
+				{
+					await SendRideCancellationNotifications(cancellationsToNotify);
+				}
+
+				return Result.Success("Ride cancelled successfully");
+			}
+			catch (Exception ex)
+			{
+				await tx.RollbackAsync();
+				_logger.LogError(ex, "Critical error during ride cancellation");
+				return Result.Failure("An internal error occurred.");
+			}
+		}
+		public async Task<Result> ArriveAtStartLocation(LocationDto model, int rideId, string driverId)
+		{
+			_logger.LogInformation("Check-in attempt for ride {RideId} at location Latitude: {Latitude}, Longitude: {Longitude}",
+				rideId, model.Latitude, model.Longitude);
+
+			var rideFound = await _unitOfWork.Rides.FirstOrDefaultAsync(
+				x => x.Id == rideId,
+				x => x.RideBookings,
+				x => x.DriverProfile);
+
+			if (rideFound == null)
+			{
+				_logger.LogWarning("Check-in failed: Ride {RideId} not found", rideId);
+				return Result.Failure("Invalid ride id");
+			}
+
+			if (rideFound.DriverProfile == null || rideFound.DriverProfile.UserId != driverId)
+			{
+				_logger.LogWarning("Check-in failed for ride {RideId}: Driver mismatch", rideId);
+				return Result.Failure("Unauthorized");
+			}
+
+			if (rideFound.Status != RideStatus.Scheduled)
+			{
+				_logger.LogWarning("Check-in failed for ride {RideId}: Invalid ride status. Current status: {Status}",
+					rideId, rideFound.Status);
+				return Result.Failure("Invalid operation");
+			}
+
+			var isValidLocation = LocationHelper.IsWithinRadius(
+				rideFound.StartLocation,
+				model.Latitude,
+				model.Longitude,
+				RidePolicies.ArrivalRadiusMeters);
+
+			if (!isValidLocation)
+			{
+				_logger.LogWarning("Check-in failed for ride {RideId}: Location validation failed. Driver position Latitude: {Latitude}, Longitude: {Longitude} is {DistanceMeters}m from pickup point",
+					rideId, model.Latitude, model.Longitude, RidePolicies.ArrivalRadiusMeters);
+				return Result.Failure("You are too far from the pickup point");
+			}
+
+			int driverWaitingTimeMinutes = (int)rideFound.WaitingTime.TotalMinutes;
+
+			var arrivalStatus = GetStatus(
+				DateTimeOffset.UtcNow,
+				rideFound.DepartureTime,
+				driverWaitingTimeMinutes,
+				RidePolicies.ArrivalGracePeriodMinutes);
+
+			if (arrivalStatus == ArrivalStatus.Early)
+			{
+				_logger.LogInformation("Check-in rejected for ride {RideId}: Driver arrived too early", rideId);
+				return Result.Failure("You arrived too early. Wait couple of minutes");
+			}
+
+			if (arrivalStatus == ArrivalStatus.Late)
+			{
+				_logger.LogInformation("Check-in completed for ride {RideId} with late arrival status. Strike will be issued", rideId);
+				// TODO: Call Strike Service here
+			}
+
+			rideFound.Status = RideStatus.CheckedIn;
+			foreach (var booking in rideFound.RideBookings.Where(b => !b.IsDeleted && b.Status == BookingStatus.Accepted))
+			{
+				booking.Status = BookingStatus.CheckedIn;
+				booking.UpdatedAt = DateTime.UtcNow;
+			}
+			rideFound.CheckedInAt = DateTime.UtcNow;
+			rideFound.UpdatedAt = DateTime.UtcNow;
+			_unitOfWork.Rides.Update(rideFound);
+			await _unitOfWork.SaveChangesAsync();
+
+			_logger.LogInformation("Ride {RideId} status updated to CheckedIn. Arrival Status: {ArrivalStatus}",
+				rideId, arrivalStatus);
+
+			string successMessage = arrivalStatus == ArrivalStatus.Late
+				? "Check-in successful, but you've received a Strike for being late. Please stick to the schedule next time."
+				: "Check-in successful. You are right on time!";
+			var ids = rideFound.RideBookings.Select(x => x.UserId).ToList();
+
+			_logger.LogInformation("Sending check-in notification to {PassengerCount} passengers for ride {RideId}",
+				ids.Count, rideId);
+
+			var notificationSent = await DriverCheckedInNotification(rideId, ids);
+			if (notificationSent.IsFailure)
+			{
+				_logger.LogError("Failed to send check-in notification for ride {RideId}", rideId);
+			}
+
+			_logger.LogInformation("Check-in successfully completed for ride {RideId}. Message: {Message}",
+				rideId, successMessage);
+
+			return Result.Success(successMessage);
+		}
+		public async Task<Result> StartRide(LocationDto model, int rideId, string driverId) {
+			var rideFound = await _unitOfWork.Rides.FirstOrDefaultAsync(
+				x => x.Id == rideId,
+				x => x.RideBookings,
+				x => x.DriverProfile);
+
+			if (rideFound == null)
+			{
+				_logger.LogWarning("Check-in failed: Ride {RideId} not found", rideId);
+				return Result.Failure("Invalid ride id");
+			}
+			if (rideFound.DriverProfile == null || rideFound.DriverProfile.UserId != driverId)
+			{
+				_logger.LogWarning("Starting ride failed for ride {RideId}: Driver mismatch", rideId);
+				return Result.Failure("Unauthorized");
+			}
+			if (rideFound.Status == RideStatus.Cancelled)
+			{
+				_logger.LogWarning("starting ride failed for ride {RideId}: Ride is canceled : {Status}",
+					rideId, rideFound.Status);
+				return Result.Failure("Ride is Canceled");
+			}
+			if (rideFound.Status == RideStatus.InProgress)
+			{
+				_logger.LogWarning("Check-in failed for ride {RideId}: Driver already InProgress", rideId);
+				return Result.Failure("Driver already Started");
+			}
+			if (rideFound.Status != RideStatus.CheckedIn)
+			{
+				_logger.LogWarning("starting ride failed for ride {RideId}: driver Didn't checkIn at first. Current status: {Status}",
+					rideId, rideFound.Status);
+				return Result.Failure("Invalid operation");
+			}
+
+
+
+			var isValidLocation = LocationHelper.IsWithinRadius(
+				rideFound.StartLocation,
+				model.Latitude,
+				model.Longitude,
+				RidePolicies.ArrivalRadiusMeters);
+
+			if (!isValidLocation)
+			{
+				_logger.LogWarning("Starting ride failed for ride {RideId}: Location validation failed. Driver position Latitude: {Latitude}, Longitude: {Longitude} is {DistanceMeters}m from pickup point",
+					rideId, model.Latitude, model.Longitude, RidePolicies.ArrivalRadiusMeters);
+				return Result.Failure("You are too far from the Starting point");
+			}
+			var isValidTime = DateTime.UtcNow < (rideFound.DepartureTime.AddMinutes(RidePolicies.AutoCancellationDeadlineMinutes));
+			if (!isValidTime) {
+				return Result.Failure("ride cancelled automatically due to late appearance");
+			}
+			rideFound.Status= RideStatus.InProgress;
+			foreach (var booking in rideFound.RideBookings.Where(b => !b.IsDeleted && b.Status == BookingStatus.CheckedIn))
+			{
+				booking.Status = BookingStatus.Started;
+				booking.UpdatedAt = DateTime.UtcNow;
+			}
+			rideFound.StartedAt = DateTime.UtcNow;
+			rideFound.UpdatedAt= DateTime.UtcNow;
+			_unitOfWork.Rides.Update(rideFound);
+			await _unitOfWork.SaveChangesAsync();
+			var ids = rideFound.RideBookings.Select(x => x.UserId).ToList();
+			await RideStartedNotification(rideFound.Id, ids);
+			return Result.Success("ride started Successfully");
+		}
+		public async Task<Result> EndRide(LocationDto model, int rideId, string driverId)
+		{
+			var rideFound = await _unitOfWork.Rides.FirstOrDefaultAsync(
+				x => x.Id == rideId && x.Status==RideStatus.InProgress,
+				x => x.RideBookings,
+				x => x.DriverProfile);
+			if (rideFound == null)
+				return Result.Failure("Invalid rideId");
+
+			if (rideFound.DriverProfile == null)
+				return Result.Failure("Driver profile not found for this ride");
+
+			if (rideFound.DriverProfile.UserId != driverId)
+				return Result.Failure("Unauthorized");
+
+			// validate driver is at (or near) the ride end location
+			var isAtEndLocation = LocationHelper.IsWithinRadius(
+				rideFound.EndLocation,
+				model.Latitude,
+				model.Longitude,
+				RidePolicies.ArrivalRadiusMeters);
+
+			if (!isAtEndLocation)
+			{
+				_logger.LogWarning("EndRide failed for ride {RideId}: Location validation failed. Driver position Latitude: {Latitude}, Longitude: {Longitude} is {DistanceMeters}m from dropoff point",
+					rideId, model.Latitude, model.Longitude, RidePolicies.ArrivalRadiusMeters);
+				return Result.Failure("You are too far from the drop off point");
+			}
+
+			var bookingIds = rideFound.RideBookings
+				.Where(b => !b.IsDeleted && b.Status == BookingStatus.Started)
+				.Select(b => b.Id)
+				.ToList();
+
+			if (!bookingIds.Any())
+			{
+				rideFound.Status = RideStatus.Completed;
+				rideFound.EndedAt = DateTime.UtcNow;
+				rideFound.UpdatedAt = DateTime.UtcNow;
+				_unitOfWork.Rides.Update(rideFound);
+				await _unitOfWork.SaveChangesAsync();
+				return Result.Success("Ride ended with no transfers");
+			}
+
+			var transferResult = await _walletService.TransferMoneyBatch(rideFound.DriverProfile.UserId, bookingIds);
+			if (transferResult.IsFailure)
+			{
+				_logger.LogError("EndRide: batch transfer failed for ride {RideId}. Error: {Error}", rideId, transferResult.Message);
+				return Result.Failure("Failed to transfer payments for ride");
+			}
+
+			foreach (var booking in rideFound.RideBookings.Where(b => !b.IsDeleted && b.Status == BookingStatus.Started))
+			{
+				booking.Status = BookingStatus.Ended;
+				booking.UpdatedAt = DateTime.UtcNow;
+			}
+
+			rideFound.Status = RideStatus.Completed;
+			rideFound.EndedAt = DateTime.UtcNow;
+			rideFound.UpdatedAt = DateTime.UtcNow;
+			_unitOfWork.Rides.Update(rideFound);
+			await _unitOfWork.SaveChangesAsync();
+
+			// notify driver and riders that ride ended
+			var passengerIds = rideFound.RideBookings.Select(b => b.UserId).ToList();
+			await MoneyTransferredToDriver(rideFound.Id, rideFound.DriverProfile.UserId);
+
+			return Result.Success("Ride ended and payments transferred successfully");
+		}
+
+		private async Task MoneyTransferredToDriver(int rideId,string DriverId )
+		{
+			try
+			{
+				var metadata = new NotificationMetadata { Preview = "your ride earnings have been successfully deposited into your wallet" };
+				await _notificationOrchestrator.NotifyAsync(new NotificationInput(DriverId, NotificationCategory.Wallet, NotificationEventCode.AmountTransferred, rideId.ToString(), metadata));
+			}
+			catch (Exception ex)
+			{
+				_logger.LogWarning(ex, "Error sending ride ended notifications for ride {RideId}", rideId);
+			}
+		}
+		private async Task SendRideCancellationNotifications(IEnumerable<(string UserId, int BookingId)> cancellations)
+		{
+			foreach (var (userId, bookingId) in cancellations)
+			{
+				var metadata = new NotificationMetadata { Preview = "Your ride request has been Canceled" };
+
+				var input = new NotificationInput(
+					userId,
+					NotificationCategory.Ride,
+					NotificationEventCode.bookingCanceled,
+					bookingId.ToString(),
+					metadata
+				);
+
+				await _notificationOrchestrator.NotifyAsync(input);
+			}
+		}
+		private async Task SendRequestNotification(string driverId, int bookingId)
+		{
+			var metadata = new NotificationMetadata { Preview = "You have a new Ride Request" };
+			var input = new NotificationInput(driverId, NotificationCategory.Ride, NotificationEventCode.bookingRequest, bookingId.ToString(), metadata);
+			await _notificationOrchestrator.NotifyAsync(input);
+		}
+		private async Task<Result<decimal>> ReleaseLockedAmountForBooking(int bookingId, string userId)
+		{
+			var lockTransactions = await _unitOfWork.WalletTransactions.FindAllAsNoTrackingAsync(
+				x => x.RideBookingId == bookingId && x.Type == TransactionType.locked);
+
+			var totalLockedAmount = lockTransactions.Sum(x => x.Amount);
+			if (totalLockedAmount <= 0)
+			{
+				_logger.LogInformation("ReleaseLockedAmountForBooking: no locked amount found for booking {BookingId}", bookingId);
+				return Result<decimal>.Success(0);
+			}
+
+			var releaseResult = await _walletService.ReleaseLockedAmountAsync(userId, totalLockedAmount);
+			if (releaseResult.IsFailure)
+			{
+				return Result<decimal>.Failure(releaseResult.Message);
+			}
+
+			return Result<decimal>.Success(totalLockedAmount);
+		}
+		private async Task SendAcceptNotification(string userId, int bookingId)
+		{
+			var metadata = new NotificationMetadata { Preview = "Your ride request has been accepted" };
+			var input = new NotificationInput(userId, NotificationCategory.Ride, NotificationEventCode.bookingAccepted, bookingId.ToString(), metadata);
+			await _notificationOrchestrator.NotifyAsync(input);
+		}
+		private async Task SendDeclineNotification(string userId, int bookingId)
+		{
+			var metadata = new NotificationMetadata { Preview = "Your ride request has been declined" };
+			var input = new NotificationInput(userId, NotificationCategory.Ride, NotificationEventCode.bookingDeclined, bookingId.ToString(), metadata);
+			await _notificationOrchestrator.NotifyAsync(input);
+		}
+		private async Task SendWalletAmountReservedNotification(string userId, int walletId, decimal amount)
+		{
+			var metadata = new WalletTransactionMetadata
+			{
+				Preview = "Amount reserved in wallet",
+				Amount = amount,
+				Type = TransactionType.locked,
+			};
+
+			var notification = new NotificationInput(
+				userId,
+				NotificationCategory.Wallet,
+				NotificationEventCode.AmountReserved,
+				walletId.ToString(),
+				metadata);
+
+			await _notificationOrchestrator.NotifyAsync(notification);
+		}
+		private async Task SendWalletAmountReleasedNotification(string userId, int walletId, decimal amount)
+		{
+			var metadata = new WalletTransactionMetadata
+			{
+				Preview = "Amount released to wallet",
+				Amount = amount,
+				Type = TransactionType.Refund,
+			};
+
+			var notification = new NotificationInput(
+				userId,
+				NotificationCategory.Wallet,
+				NotificationEventCode.AmountReleased,
+				walletId.ToString(),
+				metadata);
+
+			await _notificationOrchestrator.NotifyAsync(notification);
+		}
+		private ArrivalStatus GetStatus(DateTimeOffset currentTime, DateTimeOffset departureTime, int driverWaitingTime, int gracePeriod)
+		{
+			//the right time
+			var idealArrival = departureTime.AddMinutes(-driverWaitingTime);
+
+			// rn - the right time
+			var diff = (currentTime - idealArrival).TotalMinutes;
+
+			// too early
+			if (diff < -gracePeriod)
+			{
+				return ArrivalStatus.Early;
+			}
+
+			// on time
+			if (Math.Abs(diff) <= gracePeriod)
+			{
+				return ArrivalStatus.OnTime;
+			}
+
+			//late
+			return ArrivalStatus.Late;
+		}
+		private async Task<Result> DriverCheckedInNotification(int rideId, List<string> ids)
+		{
+			try
+			{
+				_logger.LogInformation(
+					"Attempting to send check-in notification for ride {RideId} to User IDs: [{UserIds}]",
+					rideId,
+					string.Join(", ", ids));
+
+				var metadata = new NotificationMetadata
+				{
+					Preview = "driver has arrived at the starting point"
+				};
+
+				foreach (var userId in ids)
+				{
+					await _notificationOrchestrator.NotifyAsync(
+						new NotificationInput(
+							userId,
+							NotificationCategory.Ride,
+							NotificationEventCode.DriverCheckedIn,
+							rideId.ToString(),
+							metadata));
+				}
+
+				_logger.LogInformation(
+					"Successfully sent check-in notifications for ride {RideId} to User IDs: [{UserIds}]",
+					rideId,
+					string.Join(", ", ids));
+
+				return Result.Success("Notifications sent");
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(
+					ex,
+					"Error sending check-in notification for ride {RideId} to User IDs: [{UserIds}]",
+					rideId,
+					string.Join(", ", ids));
+
+				return Result.Failure("Failed to send notifications");
+			}
+		}
+		private async Task RideStartedNotification(int rideId, List<string> ids)
+		{
+			try
+			{
+				var metadata = new NotificationMetadata
+				{
+					Preview = "driver has started the ride"
+				};
+
+				foreach (var userId in ids)
+				{
+					await _notificationOrchestrator.NotifyAsync(
+						new NotificationInput(
+							userId,
+							NotificationCategory.Ride,
+							NotificationEventCode.RideStarted,
+							rideId.ToString(),
+							metadata));
+				}
+			}
+			catch (Exception ex)
+			{
+				_logger.LogWarning(ex,
+					"Error happened while sending RideStartedNotifications");
+
+				throw;
+			}
+		}
+	}
+}

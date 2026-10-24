@@ -1,0 +1,904 @@
+﻿using Ftareqi.Application.Common;
+using Ftareqi.Application.Common.Consts;
+using Ftareqi.Application.Common.Helpers;
+using Ftareqi.Application.Common.Results;
+using Ftareqi.Application.DTOs.DriverRegistration;
+using Ftareqi.Application.DTOs.Notification;
+using Ftareqi.Application.DTOs.Profile;
+using Ftareqi.Application.Interfaces.BackgroundJobs;
+using Ftareqi.Application.Interfaces.Orchestrators;
+using Ftareqi.Application.Interfaces.Repositories;
+using Ftareqi.Application.Interfaces.Services;
+using Ftareqi.Application.Mappers;
+using Ftareqi.Domain.Enums;
+using Ftareqi.Domain.Models;
+using Ftareqi.Domain.ValueObjects;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging;
+
+
+
+namespace Ftareqi.Application.Orchestrators
+{
+
+	public class DriverOrchestrator : IDriverOrchestrator
+	{
+		private readonly IFileMapper _fileMapper;
+		private readonly IUnitOfWork _unitOfWork;
+		private readonly IBackgroundJobService _backgroundJobService;
+		private readonly ICloudinaryService _cloudinaryService;
+		private readonly ILogger<DriverOrchestrator> _logger;
+		private readonly IUserClaimsService _claimsService;
+		private readonly INotificationOrchestrator _notificationOrchestrator;
+		private readonly IDistributedCachingService _cache;
+		public DriverOrchestrator(
+			IUserService userService,
+			IUnitOfWork unitOfWork,
+			IBackgroundJobService backgroundJobService,
+			ICloudinaryService cloudinaryService,
+			ILogger<DriverOrchestrator> logger,
+			IFileMapper fileMapper,
+			IUserClaimsService claimsService,
+			INotificationOrchestrator notificationOrchestrator,
+			IDistributedCachingService cache
+			
+			)
+		{
+			_unitOfWork = unitOfWork;
+			_backgroundJobService = backgroundJobService;
+			_cloudinaryService = cloudinaryService;
+			_logger = logger;
+			_fileMapper = fileMapper;
+			_claimsService = claimsService;
+			_notificationOrchestrator = notificationOrchestrator;
+			_cache = cache;
+
+		}
+
+		//create Driver Profile
+		public async Task<Result<DriverProfileResponseDto>> CreateDriverProfileAsync(DriverProfileCreateDto driverDto)
+		{
+
+			// Validate user
+	
+			var user= await _unitOfWork.Users.FindAllAsNoTrackingAsync(x => x.Id == driverDto.UserId, x=>x.DriverProfile!);
+			if (user==null)
+			{
+				return Result<DriverProfileResponseDto>.Failure("User not found");
+			}
+			if (user.FirstOrDefault()!.DriverProfile!=null) {
+				return Result<DriverProfileResponseDto>.Failure("User already has a driver profile");
+			}
+
+			try
+			{
+				var driverProfile = new DriverProfile
+				{
+					UserId = driverDto.UserId,
+					CreatedAt = DateTime.UtcNow,
+					LicenseExpiryDate = driverDto.LicenseExpiryDate,
+					Status = DriverStatus.PendingImageUpload
+				};
+
+				await _unitOfWork.DriverProfiles.AddAsync(driverProfile);
+				await _unitOfWork.SaveChangesAsync();
+
+				_logger.LogInformation("Driver profile {profileId} created", driverProfile.Id);
+
+				var imagesToUpload = new List<(IFormFile File, ImageType Type)>
+				{
+					(driverDto.DriverProfilePhoto!, ImageType.DriverProfilePhoto),
+					(driverDto.DriverLicenseFront!, ImageType.DriverLicenseFront),
+					(driverDto.DriverLicenseBack!, ImageType.DriverLicenseBack)
+				};
+				var photosSerialized = _fileMapper.MapFilesWithTypes(imagesToUpload);
+
+
+
+				var jobId = await _backgroundJobService.EnqueueAsync<IDriverJobs>(
+					job => job.UploadDriverImagesAsync(
+						driverProfile.Id,
+						driverDto.UserId,
+						photosSerialized));
+
+				_logger.LogInformation("Background job {jobId} queued for profile {profileId}",
+					jobId, driverProfile.Id);
+
+				var response = new DriverProfileResponseDto
+				{
+					UserId = driverDto.UserId,
+					DriverProfileId = driverProfile.Id,
+					Status = driverProfile.Status.ToString(),
+					Message = "Driver profile created. Images are being uploaded in the background."
+				};
+
+				await _cache.RemoveDriverProfileCachesAsync(driverDto.UserId);
+
+				return Result<DriverProfileResponseDto>.Success(response);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error creating driver profile");
+				throw;
+			}
+		}
+
+		//Create Car For DriverProfile
+		public async Task<Result<CarResponseDto>> CreateCarForDriverProfile(CarCreateDto carDto)
+		{
+			//validate DriverProfile
+			var found = await _unitOfWork.DriverProfiles.FindAllAsTrackingAsync(x => x.UserId == carDto.UserId,x=>x.Car!);
+			if (!found.Any())
+				return Result<CarResponseDto>.Failure("UserProfile don't exist");
+			// create car itself
+			if (found.FirstOrDefault()!.Car != null)
+				return Result<CarResponseDto>.Failure("Driver profile already has a car");
+			var driverProfile = found.FirstOrDefault()!;
+
+			var car = new Car
+			{
+				LicenseExpiryDate=carDto.LicenseExpiryDate,
+				DriverProfileId = found.FirstOrDefault()!.Id,
+				Color = carDto.Color!,
+				Model = carDto.Model!,
+				Plate = carDto.Plate!,
+				NumOfSeats = carDto.NumOfSeats,
+				CreatedAt = DateTime.UtcNow,
+			};
+			driverProfile.Status = DriverStatus.PendingImageUpload;
+			driverProfile.UpdatedAt = DateTime.UtcNow;
+			_unitOfWork.DriverProfiles.Update(driverProfile);
+
+			await _unitOfWork.Cars.AddAsync(car);
+			await _unitOfWork.SaveChangesAsync();
+			_logger.LogInformation("Car{carid} Created successfully to driver profile", car.Id);
+
+			//ConvertPhotos
+			var photsList = new List<(IFormFile File, ImageType Type)>
+			{
+				(carDto.CarPhoto!, ImageType.CarPhoto),
+				(carDto.CarLicenseBack!, ImageType.CarLicenseBack),
+				(carDto.CarLicenseFront!, ImageType.CarLicenseFront)
+			};
+			var photosSerialized = _fileMapper.MapFilesWithTypes(photsList);
+			//create images 
+			var jobId = await _backgroundJobService.EnqueueAsync<ICarJobs>(
+				job => job.UploadCarImagesAsync(car.Id, photosSerialized));
+			_logger.LogInformation("Background job {jobId} queued for car {carid}", jobId, car.Id);
+
+			//return carDto
+			var response = new CarResponseDto
+			{
+				CarId = car.Id,
+				Color = car.Color!,
+				CreatedAt = car.CreatedAt,
+				Model = car.Model!,
+				DriverProfileId = car.DriverProfileId!,
+				NumOfSeats = car.NumOfSeats,
+				Plate = car.Plate!,
+				LicenseExpiryDate= car.LicenseExpiryDate!,
+			};
+			return Result<CarResponseDto>.Success(response);
+		}
+
+		// Get details for driver profile
+		public async Task<Result<DriverWithCarResponseDto>> GetDriverDetails(int driverId)
+		{
+			if (driverId<0)
+				return Result<DriverWithCarResponseDto>.Failure("Invalid driver profile id ");
+			try
+			{
+				var profile = await _unitOfWork.DriverProfiles.GetDriverProfilesWithCarAsync(x=> x.Id == driverId);
+				if (profile == null)
+				{
+					return Result<DriverWithCarResponseDto>.Failure("User Not Found");
+				}
+				if (profile.Status != DriverStatus.Pending)
+				{
+					return Result<DriverWithCarResponseDto>.Failure("User updating his profile");
+				}
+				var result = DriverProfileMapper.ToDto(profile);
+				return Result<DriverWithCarResponseDto>.Success(result);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error happened{message}", ex.Message);
+				return Result < DriverWithCarResponseDto>.Failure("Unexpected error happened");
+			}
+		}
+
+		// Get pending profiles for moderator
+		public async Task<Result<PaginatedResponse<DriverProfileWithUsernameDto>>> GetPendingDriverProfiles(GenericQueryReq page)
+		{
+			var shouldUseFirstPageCache = page.Page == 1 && page.PageSize == 10 && page.SortDescending;
+			var cacheKey = CacheKeys.PendingDriverProfilesFirstPage();
+
+			if (shouldUseFirstPageCache)
+			{
+				var cachedPendingProfiles = await _cache.GetAsync<PaginatedResponse<DriverProfileWithUsernameDto>>(cacheKey);
+				if (cachedPendingProfiles != null)
+				{
+					_logger.LogInformation("Pending driver profiles first page retrieved from cache");
+					return Result<PaginatedResponse<DriverProfileWithUsernameDto>>.Success(cachedPendingProfiles);
+				}
+			}
+
+			// Get paged data from repository
+			var (profilesItems, totalCount) = await _unitOfWork.DriverProfiles.GetPagedAsync(
+				page.Page,
+				page.PageSize,
+				x => x.CreatedAt,
+				x => x.Status == DriverStatus.Pending,
+				page.SortDescending,
+				x => x.User!,
+				x=>x.Images,
+				x=>x.Car!);
+
+			// Map to DTO
+			var results = profilesItems.Select(x => new DriverProfileWithUsernameDto
+			{
+				DriverProfileId=x.User!.DriverProfile!.Id,
+				CreatedAt = x.CreatedAt,
+				PhoneNumber = x.User!.PhoneNumber,
+				FullName = x.User!.FullName,
+				DriverPhoto = x.Images
+			   .Where(img => img.Type == ImageType.DriverProfilePhoto)
+			   .Select(img => img.Url)
+			   .FirstOrDefault()
+			}).ToList();
+
+			// Calculate total pages
+			var totalPages = (int)Math.Ceiling((double)totalCount / page.PageSize);
+
+			// Prepare response
+			var returnModel = new PaginatedResponse<DriverProfileWithUsernameDto>
+			{
+				Items = results,
+				Page = page.Page,
+				PageSize = page.PageSize,
+				TotalCount = totalCount,
+				TotalPages = totalPages
+			};
+
+			if (shouldUseFirstPageCache)
+			{
+				await _cache.SetAsync(cacheKey, returnModel, TimeSpan.FromMinutes(1));
+			}
+
+			return Result<PaginatedResponse<DriverProfileWithUsernameDto>>.Success(returnModel);
+		}
+
+		//approve driver profile request
+		public async Task <Result> ApproveDriverProfile(int profileId)
+		{
+		var profileFound= await _unitOfWork.DriverProfiles.GetByIdAsync(profileId);
+			if (profileFound == null)
+				return Result.Failure("Invalid profile id");
+			profileFound.Status=DriverStatus.Active;
+			var claimsAdded = await _claimsService.AddClaimAsync(profileFound.UserId, CustomClaimTypes.IsDriver, CustomClaimTypes.True);
+			if (claimsAdded.IsFailure)
+			{
+				return Result.Failure(claimsAdded.Errors);
+			}
+			profileFound.UpdatedAt = DateTime.UtcNow;
+			 _unitOfWork.DriverProfiles.Update(profileFound);
+			await _unitOfWork.SaveChangesAsync();
+
+			//Send notification
+			await SendDriverApprovalNotificationAsync(profileFound.UserId, profileId);
+
+			await _cache.RemoveDriverProfileCachesAsync(profileFound.UserId);
+
+			return Result.Success("Driver Profile approved successfully");
+
+		}
+
+		//reject driver profile request
+		public async Task<Result> RejectDriverProfile(int profileId)
+		{
+			var profileFound = await _unitOfWork.DriverProfiles.GetByIdAsync(profileId);
+			if (profileFound == null)
+				return Result.Failure("Invalid profile id");
+
+			profileFound.Status = DriverStatus.Rejected;
+
+			var userClaims = await _claimsService.GetUserClaimsAsync(profileFound.UserId);
+			if (userClaims.IsSuccess && userClaims.Data != null)
+			{
+				var driverClaims = userClaims.Data.Where(c => c.Key == CustomClaimTypes.IsDriver);
+
+				foreach (var claim in driverClaims)
+				{
+					await _claimsService.RemoveClaimAsync(profileFound.UserId, claim.Key);
+				}
+			}
+			profileFound.UpdatedAt = DateTime.UtcNow;
+			_unitOfWork.DriverProfiles.Update(profileFound);
+			await _unitOfWork.SaveChangesAsync();
+			await SendDriverRejectionNotificationAsync(profileFound.UserId, profileId);
+
+			await _cache.RemoveDriverProfileCachesAsync(profileFound.UserId);
+
+			return Result.Success("Driver Profile rejected successfully and driver claims removed.");
+		}
+		//Update Driver Profile
+		public async Task<Result<DriverProfileResponseDto>> UpdateDriverProfileAsync(DriverProfileUpdateDto driverDto)
+		{
+			try
+			{
+				// 1. Validate user and get driver profile with images
+				var driverProfiles = await _unitOfWork.DriverProfiles.FindAllAsTrackingAsync(
+					x => x.UserId == driverDto.UserId,
+					x => x.Images!);
+
+				if (driverProfiles == null || !driverProfiles.Any())
+				{
+					return Result<DriverProfileResponseDto>.Failure("Driver profile not found");
+				}
+
+				var driverProfile = driverProfiles.FirstOrDefault()!;
+
+				// 2. Block updates if status is PendingImageUpload
+				if (driverProfile.Status == DriverStatus.PendingImageUpload)
+				{
+					return Result<DriverProfileResponseDto>.Failure(
+						"Cannot update profile while images are being uploaded. Please wait for the upload to complete.");
+				}
+
+				// 3. Update data fields
+				if (driverDto.LicenseExpiryDate.HasValue)
+				{
+					driverProfile.LicenseExpiryDate = driverDto.LicenseExpiryDate.Value;
+				}
+
+				// 4. Handle image updates
+				var hasImageUpdates = driverDto.DriverProfilePhoto != null ||
+									 driverDto.DriverLicenseFront != null ||
+									 driverDto.DriverLicenseBack != null;
+
+				List<string> oldImagePublicIds = new List<string>();
+				List<Image> imagesToDelete = new List<Image>();
+
+				if (hasImageUpdates && driverProfile.Images != null && driverProfile.Images.Any())
+				{
+					// Collect PublicIds and images that will be replaced
+					if (driverDto.DriverProfilePhoto != null)
+					{
+						var oldImage = driverProfile.Images
+							.FirstOrDefault(x => x.Type == ImageType.DriverProfilePhoto);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					if (driverDto.DriverLicenseFront != null)
+					{
+						var oldImage = driverProfile.Images
+							.FirstOrDefault(x => x.Type == ImageType.DriverLicenseFront);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					if (driverDto.DriverLicenseBack != null)
+					{
+						var oldImage = driverProfile.Images
+							.FirstOrDefault(x => x.Type == ImageType.DriverLicenseBack);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					// Delete old images from database
+					if (imagesToDelete.Any())
+					{
+						_unitOfWork.Images.DeleteRange(imagesToDelete);
+
+						_logger.LogInformation("Deleted {count} old driver images from database for profile {profileId}",
+							imagesToDelete.Count, driverProfile.Id);
+					}
+				}
+
+				// 5. Set status to Pending and remove claims
+				var previousStatus = driverProfile.Status;
+				driverProfile.Status = DriverStatus.Pending;
+				driverProfile.UpdatedAt = DateTime.UtcNow;
+
+				// Remove driver claims
+				if (previousStatus == DriverStatus.Active)
+				{
+					var userClaims = await _claimsService.GetUserClaimsAsync(driverDto.UserId);
+					if (userClaims.IsSuccess && userClaims.Data != null)
+					{
+						var driverClaims = userClaims.Data.Where(c => c.Key == CustomClaimTypes.IsDriver);
+						foreach (var claim in driverClaims)
+						{
+							await _claimsService.RemoveClaimAsync(driverDto.UserId, claim.Key);
+						}
+					}
+				}
+
+				// 6. Handle image deletion and upload immediately
+				if (hasImageUpdates)
+				{
+					// Delete old images from Cloudinary
+					if (oldImagePublicIds.Any())
+					{
+						var deleteResult = await _cloudinaryService.DeleteImagesAsync(oldImagePublicIds);
+						if (deleteResult.IsFailure)
+						{
+							return Result<DriverProfileResponseDto>.Failure(
+								$"Failed to delete old images: {deleteResult.Message}");
+						}
+
+						_logger.LogInformation("Deleted {count} old driver images from Cloudinary for profile {profileId}",
+							oldImagePublicIds.Count, driverProfile.Id);
+					}
+
+					// Prepare new images for upload
+					var imagesToUpload = new List<(IFormFile File, ImageType Type)>();
+
+					if (driverDto.DriverProfilePhoto != null)
+						imagesToUpload.Add((driverDto.DriverProfilePhoto, ImageType.DriverProfilePhoto));
+
+					if (driverDto.DriverLicenseFront != null)
+						imagesToUpload.Add((driverDto.DriverLicenseFront, ImageType.DriverLicenseFront));
+
+					if (driverDto.DriverLicenseBack != null)
+						imagesToUpload.Add((driverDto.DriverLicenseBack, ImageType.DriverLicenseBack));
+
+					var photosSerialized = _fileMapper.MapFilesWithTypes(imagesToUpload);
+
+					// Upload new images immediately
+					var uploadResult = await _cloudinaryService.UploadPhotosAsync(photosSerialized);
+					if (uploadResult.IsFailure)
+					{
+						return Result<DriverProfileResponseDto>.Failure(
+							$"Failed to upload new images: {string.Join(", ", uploadResult.Errors)}");
+					}
+
+					var newImages = uploadResult.Data!.Select(img => new Image
+					{
+						Url = img.ImageUrl!,
+						PublicId = img.deleteId!,
+						Type = img.ImageType,
+						CreatedAt = DateTime.UtcNow,
+						DriverProfileId = driverProfile.Id
+					}).ToList();
+
+					if (newImages.Any())
+					{
+						await _unitOfWork.Images.AddRangeAsync(newImages);
+					}
+
+					_logger.LogInformation("Uploaded {count} new driver images for profile {profileId}",
+						newImages.Count, driverProfile.Id);
+				}
+
+				// 7. Update the profile and persist all changes
+				_unitOfWork.DriverProfiles.Update(driverProfile);
+				await _unitOfWork.SaveChangesAsync();
+
+				_logger.LogInformation("Driver profile {profileId} updated. Status changed from {oldStatus} to Pending",
+					driverProfile.Id, previousStatus);		
+
+				var response = new DriverProfileResponseDto
+				{
+					UserId = driverDto.UserId,
+					DriverProfileId = driverProfile.Id,
+					Status = driverProfile.Status.ToString(),
+					Message = hasImageUpdates
+						? "Driver profile and images updated successfully. Profile set to Pending status for re-approval."
+						: "Driver profile updated. Profile set to Pending status for re-approval."
+				};
+				await _cache.RemoveDriverProfileCachesAsync(driverDto.UserId);
+				return Result<DriverProfileResponseDto>.Success(response);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error updating driver profile");
+				throw;
+			}
+		}
+
+		//Update car Profile
+		public async Task<Result<CarResponseDto>> UpdateCarAsync(CarUpdateDto carDto)
+		{
+			try
+			{
+				// 1. Get driver profile with car and images
+				var driverProfiles = await _unitOfWork.DriverProfiles.FindAllAsTrackingAsync(
+					x => x.UserId == carDto.UserId,
+					x => x.Car!,
+					x => x.Car!.Images!);
+
+				if (driverProfiles == null || !driverProfiles.Any())
+				{
+					return Result<CarResponseDto>.Failure("Driver profile not found");
+				}
+
+				var driverProfile = driverProfiles.FirstOrDefault()!;
+
+				if (driverProfile.Car == null)
+				{
+					return Result<CarResponseDto>.Failure("Car not found for this driver profile");
+				}
+
+				// 2. Block updates if driver profile status is PendingImageUpload
+				if (driverProfile.Status == DriverStatus.PendingImageUpload)
+				{
+					return Result<CarResponseDto>.Failure(
+						"Cannot update car while driver profile images are being uploaded. Please wait for the upload to complete.");
+				}
+
+				var car = driverProfile.Car;
+
+				// 3. Update data fields
+				if (!string.IsNullOrWhiteSpace(carDto.Color))
+					car.Color = carDto.Color;
+
+				if (!string.IsNullOrWhiteSpace(carDto.Model))
+					car.Model = carDto.Model;
+
+				if (!string.IsNullOrWhiteSpace(carDto.Plate))
+					car.Plate = carDto.Plate;
+
+				if (carDto.NumOfSeats.HasValue)
+					car.NumOfSeats = carDto.NumOfSeats.Value;
+
+				if (carDto.LicenseExpiryDate.HasValue)
+					car.LicenseExpiryDate = carDto.LicenseExpiryDate.Value;
+
+				// 4. Handle image updates
+				var hasImageUpdates = carDto.CarPhoto != null ||
+									 carDto.CarLicenseBack != null ||
+									 carDto.CarLicenseFront != null;
+
+				List<string> oldImagePublicIds = new List<string>();
+				List<Image> imagesToDelete = new List<Image>();
+
+				if (hasImageUpdates && car.Images != null && car.Images.Any())
+				{
+					// Collect PublicIds and images that will be replaced
+					if (carDto.CarPhoto != null)
+					{
+						var oldImage = car.Images
+							.FirstOrDefault(x => x.Type == ImageType.CarPhoto);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					if (carDto.CarLicenseBack != null)
+					{
+						var oldImage = car.Images
+							.FirstOrDefault(x => x.Type == ImageType.CarLicenseBack);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					if (carDto.CarLicenseFront != null)
+					{
+						var oldImage = car.Images
+							.FirstOrDefault(x => x.Type == ImageType.CarLicenseFront);
+						if (oldImage != null)
+						{
+							if (!string.IsNullOrWhiteSpace(oldImage.PublicId))
+								oldImagePublicIds.Add(oldImage.PublicId);
+							imagesToDelete.Add(oldImage);
+						}
+					}
+
+					// Delete old images from database using DeleteRange
+					if (imagesToDelete.Any())
+					{
+						_unitOfWork.Images.DeleteRange(imagesToDelete);
+
+						_logger.LogInformation("Deleted {count} old car images from database for car {carId}",
+							imagesToDelete.Count, car.Id);
+					}
+				}
+
+				// 5. Set driver profile status to Pending and remove claims
+				var previousStatus = driverProfile.Status;
+				driverProfile.Status = DriverStatus.Pending;
+				driverProfile.UpdatedAt = DateTime.UtcNow;
+
+				// Remove driver claims
+				if (previousStatus == DriverStatus.Active)
+				{
+					var userClaims = await _claimsService.GetUserClaimsAsync(carDto.UserId);
+					if (userClaims.IsSuccess && userClaims.Data != null)
+					{
+						var driverClaims = userClaims.Data.Where(c => c.Key == CustomClaimTypes.IsDriver);
+						foreach (var claim in driverClaims)
+						{
+							await _claimsService.RemoveClaimAsync(carDto.UserId, claim.Key);
+						}
+					}
+				}
+
+				// 6. Handle image deletion and upload immediately
+				if (hasImageUpdates)
+				{
+					// Delete old images from Cloudinary
+					if (oldImagePublicIds.Any())
+					{
+						var deleteResult = await _cloudinaryService.DeleteImagesAsync(oldImagePublicIds);
+						if (deleteResult.IsFailure)
+						{
+							return Result<CarResponseDto>.Failure($"Failed to delete old car images: {deleteResult.Message}");
+						}
+
+						_logger.LogInformation("Deleted {count} old car images from Cloudinary for car {carId}",
+							oldImagePublicIds.Count, car.Id);
+					}
+
+					// Prepare new images for upload
+					var imagesToUpload = new List<(IFormFile File, ImageType Type)>();
+
+					if (carDto.CarPhoto != null)
+						imagesToUpload.Add((carDto.CarPhoto, ImageType.CarPhoto));
+
+					if (carDto.CarLicenseBack != null)
+						imagesToUpload.Add((carDto.CarLicenseBack, ImageType.CarLicenseBack));
+
+					if (carDto.CarLicenseFront != null)
+						imagesToUpload.Add((carDto.CarLicenseFront, ImageType.CarLicenseFront));
+
+					var photosSerialized = _fileMapper.MapFilesWithTypes(imagesToUpload);
+
+					// Upload new images immediately
+					var uploadResult = await _cloudinaryService.UploadPhotosAsync(photosSerialized);
+					if (uploadResult.IsFailure)
+					{
+						return Result<CarResponseDto>.Failure(
+							$"Failed to upload new car images: {string.Join(", ", uploadResult.Errors)}");
+					}
+
+					var newImages = uploadResult.Data!.Select(img => new Image
+					{
+						Url = img.ImageUrl!,
+						PublicId = img.deleteId!,
+						Type = img.ImageType,
+						CreatedAt = DateTime.UtcNow,
+						CarId = car.Id
+					}).ToList();
+
+					if (newImages.Any())
+					{
+						await _unitOfWork.Images.AddRangeAsync(newImages);
+					}
+
+					_logger.LogInformation("Uploaded {count} new car images for car {carId}",
+						newImages.Count, car.Id);
+				}
+
+				// 7. Update car and driver profile and persist all changes
+				car.UpdatedAt = DateTime.UtcNow;
+				_unitOfWork.Cars.Update(car);
+				_unitOfWork.DriverProfiles.Update(driverProfile);
+				await _unitOfWork.SaveChangesAsync();
+
+				_logger.LogInformation("Car {carId} updated for driver profile {profileId}. Profile status changed from {oldStatus} to Pending",
+					car.Id, driverProfile.Id, previousStatus);
+
+				var response = new CarResponseDto
+				{
+					CarId = car.Id,
+					Color = car.Color!,
+					CreatedAt = car.CreatedAt,
+					Model = car.Model!,
+					DriverProfileId = car.DriverProfileId!,
+					NumOfSeats = car.NumOfSeats,
+					Plate = car.Plate!,
+					LicenseExpiryDate = car.LicenseExpiryDate!,
+				};
+
+				_logger.LogInformation("Car profile update completed for car {carId}", car.Id);
+
+				await _cache.RemoveDriverProfileCachesAsync(driverProfile.UserId);
+				return Result<CarResponseDto>.Success(response);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error updating car");
+				throw;
+			}
+		}
+		public async Task<Result<DriverProfileResponse>> GetDriverProfile(string userId)
+		{
+			var key = CacheKeys.DriverProfile(userId);
+			if (string.IsNullOrEmpty(userId))
+				return Result<DriverProfileResponse>.Failure("No such id"); 
+			//check in cache 
+			var cachedDriverProfile = await _cache.GetAsync<DriverProfileResponse>(key);
+			if(cachedDriverProfile != null)
+			{
+				_logger.LogInformation("Driver profile:{profile} retrieved from cache", cachedDriverProfile);
+				return Result<DriverProfileResponse>.Success(cachedDriverProfile);
+			}
+			var driverProfile = await _unitOfWork.DriverProfiles.FirstOrDefaultAsync(x=>x.UserId == userId, x=>x.Images ,x=>x.Rides);
+			if (driverProfile == null)
+			{
+				return Result<DriverProfileResponse>.Failure("Driver profile doesn't exist");
+			}
+			var images = driverProfile.Images;
+			var rating = driverProfile.RatingCount > 0
+					? Math.Round(((double)driverProfile.RatingSum / driverProfile.RatingCount) * 2) / 2.0
+					: (double?)null;
+			var response = new DriverProfileResponse
+			{
+				Id = driverProfile.Id,
+				CreatedAt = driverProfile.CreatedAt,
+				Status = driverProfile.Status,
+				LicenseExpiryDate = driverProfile.LicenseExpiryDate,
+				DriverProfilePhoto = images?
+					.FirstOrDefault(x => x.Type == ImageType.DriverProfilePhoto)
+					?.Url,
+				DriverLicenseFront = images?
+					.FirstOrDefault(x => x.Type == ImageType.DriverLicenseFront)
+					?.Url,
+				DriverLicenseBack = images?
+					.FirstOrDefault(x => x.Type == ImageType.DriverLicenseBack)
+					?.Url,
+				TripsOfferedCount = driverProfile.Rides.Where(x=>x.Status==RideStatus.Completed).Count(),
+				Rating= rating
+			};
+			//cache it 
+			await _cache.SetAsync(key, response, TimeSpan.FromMinutes(5));
+			return Result<DriverProfileResponse>.Success(response);
+		}
+		public async Task<Result<CarProfileResponseDto>> GetCarProfile(string userId)
+		{
+			var key = CacheKeys.DriverCarProfile(userId);
+			var driverProfile = await _unitOfWork.DriverProfiles
+					.FirstOrDefaultAsync(dp => dp.UserId == userId);
+			if (driverProfile == null)
+				return Result<CarProfileResponseDto>.Failure("Driver profile not found");
+			//Check cache first
+			var cachedCar= await _cache.GetAsync<CarProfileResponseDto>(key);
+			if(cachedCar != null)
+			{
+				_logger.LogInformation("Car profile {cachedCar} found in cache", cachedCar);
+				return Result<CarProfileResponseDto>.Success(cachedCar);
+			}
+
+
+			var car = await _unitOfWork.Cars
+			.FirstOrDefaultAsync(
+				x => x.DriverProfileId == driverProfile.Id,
+				x => x.Images,
+				x => x.DriverProfile!
+			);
+
+			if (car == null)
+				return Result<CarProfileResponseDto>.Failure("Car not found for this driver");
+
+			var images = car.Images;
+
+			var response = new CarProfileResponseDto
+			{
+				Id = car.Id,
+				Model = car.Model,
+				Color = car.Color,
+				Plate = car.Plate,
+				NumOfSeats = car.NumOfSeats,
+				LicenseExpiryDate = car.LicenseExpiryDate,
+				CreatedAt = car.CreatedAt,
+				CarPhoto = images?
+					.FirstOrDefault(x => x.Type == ImageType.CarPhoto)
+					?.Url,
+				CarLicenseFront = images?
+					.FirstOrDefault(x => x.Type == ImageType.CarLicenseFront)
+					?.Url,
+				CarLicenseBack = images?
+					.FirstOrDefault(x => x.Type == ImageType.CarLicenseBack)
+					?.Url
+			};
+			await _cache.SetAsync(key, response,TimeSpan.FromMinutes(5));
+			return Result<CarProfileResponseDto>.Success(response);
+		}
+
+		public async Task<Result<PublicDriverProfileDto>> GetPublicDriverProfile(string userId)
+		{
+			if (string.IsNullOrWhiteSpace(userId))
+			{
+				return Result<PublicDriverProfileDto>.Failure("User id is required");
+			}
+
+			try
+			{
+				var driverProfile = await _unitOfWork.DriverProfiles.FirstOrDefaultAsync(
+					x => x.UserId == userId && !x.IsDeleted && x.Status == DriverStatus.Active,
+					x => x.User!,
+					x => x.Images,
+					x => x.Car!,
+					x => x.Car!.Images!);
+
+				if (driverProfile == null)
+				{
+					return Result<PublicDriverProfileDto>.Failure("Driver profile not found");
+				}
+
+				var completedTripsCount = await _unitOfWork.Rides.CountAsync(
+					x => x.DriverProfileId == driverProfile.Id && x.Status == RideStatus.Completed);
+
+				var rating = driverProfile.RatingCount > 0
+					? Math.Round(((double)driverProfile.RatingSum / driverProfile.RatingCount) * 2) / 2.0
+					: (double?)null;
+
+				var result = new PublicDriverProfileDto
+				{
+					Name = driverProfile.User?.FullName,
+					Gender = driverProfile.User?.Gender ?? default,
+					JoinedAt = driverProfile.CreatedAt,
+					DriverImg = driverProfile.Images?
+						.FirstOrDefault(x => x.Type == ImageType.DriverProfilePhoto)
+						?.Url,
+					Rating = rating,
+					TripsTaken = completedTripsCount,
+					CarImg = driverProfile.Car?.Images?
+						.FirstOrDefault(x => x.Type == ImageType.CarPhoto)
+						?.Url,
+					CarModel = driverProfile.Car?.Model,
+					CarPlate = driverProfile.Car?.Plate
+				};
+
+				return Result<PublicDriverProfileDto>.Success(result);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error while getting public driver profile for user {UserId}", userId);
+				return Result<PublicDriverProfileDto>.Failure("Unexpected error happened while getting public driver profile");
+			}
+		}
+		private async Task SendDriverApprovalNotificationAsync(string userId, int profileId)
+		{
+			var input = new NotificationInput(
+				userId,
+				NotificationCategory.DriverRegistration,
+				NotificationEventCode.Approved,
+				profileId.ToString(),
+				new NotificationMetadata
+				{
+					Preview = "Your driver registration has been approved. You can now start accepting rides"
+				});
+
+			await _notificationOrchestrator.NotifyAsync(input);
+		}
+
+		private async Task SendDriverRejectionNotificationAsync(string userId, int profileId)
+		{
+			var input = new NotificationInput(
+				userId,
+				NotificationCategory.DriverRegistration,
+				NotificationEventCode.Rejected,
+				profileId.ToString(),
+				new NotificationMetadata
+				{
+					Preview = "Your driver registration request was not approved. Please review your information and try again."
+				});
+
+			await _notificationOrchestrator.NotifyAsync(input);
+		}
+
+	}
+}
