@@ -1,8 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { useSearchParams } from "next/navigation"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { ArrowLeft, CalendarDays, CarFront, Loader2, MapPin, Search, SlidersHorizontal } from "lucide-react"
 import { SiteHeader } from "@/components/layout/site-header"
 import { Button } from "@/components/ui/button"
@@ -16,10 +15,16 @@ import type { RideSearchResult } from "@/types/ride"
 function formatDate(value: string) { return new Intl.DateTimeFormat("fr-TN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) }
 
 export default function RidesPage() {
-  const params = useSearchParams()
-  const [from, setFrom] = useState(params.get("depart") ?? "")
-  const [to, setTo] = useState(params.get("arrivee") ?? "")
-  const [date, setDate] = useState(params.get("date") ?? "")
+  const [from, setFrom] = useState("")
+  const [to, setTo] = useState("")
+  const [date, setDate] = useState("")
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    setFrom(params.get("depart") ?? "")
+    setTo(params.get("arrivee") ?? "")
+    setDate(params.get("date") ?? "")
+  }, [])
   const [rides, setRides] = useState<RideSearchResult[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")

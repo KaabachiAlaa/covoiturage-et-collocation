@@ -1,33 +1,20 @@
-import type { Paginated, PageQuery } from "@/types/api"
-import type {
-  CreateBookingRequest,
-  DriverBookingRequest,
-  DriverRequestsQuery,
-  UpcomingBookingsQuery,
-  UserBooking,
-} from "@/types/booking"
-import { apiRequest } from "./api-client"
+import { apiRequest, type QueryParams } from "./api-client"
+import type { BookingPage, BookingQuery } from "@/types/booking"
 
-const BASE = "/api/ride-bookings"
+export function getUpcomingBookings(query: BookingQuery = {}, signal?: AbortSignal) {
+  return apiRequest<BookingPage>("/api/ride-bookings/user/upcoming", {
+    query: query as QueryParams,
+    signal,
+  })
+}
 
-export const bookingsService = {
-  /** Creates a Pending booking; the backend locks the amount in the rider's wallet. */
-  create: (payload: CreateBookingRequest) => apiRequest(BASE, { method: "POST", body: payload }),
+export function getBookingHistory(query: BookingQuery = {}, signal?: AbortSignal) {
+  return apiRequest<BookingPage>("/api/ride-bookings/user/history", {
+    query: query as QueryParams,
+    signal,
+  })
+}
 
-  getById: (bookingId: number) => apiRequest<UserBooking>(`${BASE}/${bookingId}`),
-
-  userUpcoming: (query: UpcomingBookingsQuery = {}) =>
-    apiRequest<Paginated<UserBooking>>(`${BASE}/user/upcoming`, { query: { ...query } }),
-
-  userHistory: (query: PageQuery = {}) =>
-    apiRequest<Paginated<UserBooking>>(`${BASE}/user/history`, { query: { ...query } }),
-
-  cancelByRider: (bookingId: number) => apiRequest(`${BASE}/${bookingId}/cancel`, { method: "POST" }),
-
-  driverRequests: (query: DriverRequestsQuery = {}) =>
-    apiRequest<Paginated<DriverBookingRequest>>(`${BASE}/driver/requests`, { query: { ...query } }),
-
-  accept: (bookingId: number) => apiRequest(`${BASE}/${bookingId}/accept`, { method: "POST" }),
-
-  decline: (bookingId: number) => apiRequest(`${BASE}/${bookingId}/decline`, { method: "POST" }),
+export function cancelBooking(bookingId: number) {
+  return apiRequest(`/api/ride-bookings/${bookingId}/cancel`, { method: "POST" })
 }
